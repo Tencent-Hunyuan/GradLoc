@@ -1,0 +1,502 @@
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 69767c4a..fbf2ab2b 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1206,6 +1206,7 @@ class RayPPOTrainer:
+     def _update_actor(self, batch: DataProto) -> DataProto:
+         rollout_config = self.config.actor_rollout_ref.rollout
+         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
++        batch.meta_info["global_steps"] = self.global_steps
+         # TODO: Make "temperature" single source of truth from generation.
+         batch.meta_info["temperature"] = rollout_config.temperature
+         # update actor
+diff --git a/verl/utils/reward_score/__init__.py b/verl/utils/reward_score/__init__.py
+index b65d94ec..f5ed543c 100644
+--- a/verl/utils/reward_score/__init__.py
++++ b/verl/utils/reward_score/__init__.py
+@@ -45,6 +45,10 @@ def default_compute_score(
+         from . import gsm8k
+ 
+         res = gsm8k.compute_score(solution_str, ground_truth)
++    elif data_source == "math_verify":
++        from . import math_verify
++
++        res = math_verify.compute_score(solution_str, ground_truth)
+     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+         from . import math_reward
+ 
+diff --git a/verl/utils/reward_score/math_verify.py b/verl/utils/reward_score/math_verify.py
+index c1ce7c1a..560c26e3 100644
+--- a/verl/utils/reward_score/math_verify.py
++++ b/verl/utils/reward_score/math_verify.py
+@@ -21,6 +21,13 @@ except ImportError:
+ 
+ 
+ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
++    import multiprocessing as mp
++    # using another process to compute the score
++    with mp.Pool(processes=1) as pool:
++        result = pool.apply_async(_compute_score, (model_output, ground_truth, timeout_score))
++        return result.get()
++
++def _compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
+     verify_func = math_metric(
+         gold_extraction_target=(LatexExtractionConfig(),),
+         pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index c4e1c93f..8ecaaf3c 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -17,7 +17,9 @@
+ Single Process Actor
+ """
+ 
++import json
+ import logging
++import math
+ import os
+ 
+ import torch
+@@ -393,6 +395,303 @@ class DataParallelPPOActor(BasePPOActor):
+                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+ 
+         return log_probs, entropys
++    
++    # --- START BISECT GRADIENT SPIKE HELPERS ---
++    def _compute_grad_norm(self):
++        """Compute the norm of the gradients (unscaled if possible, otherwise scaled)."""
++        local_sq = torch.tensor(0.0, device=next(self.actor_module.parameters()).device)
++        for p in self.actor_module.parameters():
++            if p.grad is not None:
++                local_sq += p.grad.pow(2).sum()
++        if torch.distributed.is_initialized():
++            torch.distributed.all_reduce(local_sq, op=torch.distributed.ReduceOp.SUM)
++        norm = local_sq.sqrt()
++        # Try to roughly unscale if scaler is present to match threshold
++        if self.scaler is not None:
++            scale = self.scaler.get_scale()
++            if scale > 1e-6:
++                norm = norm / scale
++        return norm
++
++    def _compute_grad_norm_recompute(self, model_inputs: dict, response_mask: torch.Tensor, active_rank_range: tuple[int, int] | None = None, temperature: float = 1.0, on_policy: bool = False):
++        device = next(self.actor_module.parameters()).device
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        self.actor_optimizer.zero_grad()
++
++        # Forward
++        entropy_coeff = self.config.entropy_coeff
++        calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
++        
++        entropy, log_prob = self._forward_micro_batch(
++            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
++        )
++
++        # Check if rank is active for bisect
++        is_active = True
++        if active_rank_range is not None:
++            if not (active_rank_range[0] <= rank <= active_rank_range[1]):
++                is_active = False
++        
++        if not is_active:
++            # If not active, contribute 0 gradient
++            loss = log_prob.sum() * 0.0
++        else:
++            # Recompute loss using same logic as update_policy
++            if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
++                old_log_prob = model_inputs["old_log_probs"]
++            else:
++                if on_policy:
++                    old_log_prob = log_prob.detach()
++                else:
++                    old_log_prob = model_inputs["old_log_probs"]
++            
++            advantages = model_inputs["advantages"]
++            loss_agg_mode = self.config.loss_agg_mode
++            
++            # Policy loss
++            loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
++            policy_loss_fn = get_policy_loss_fn(loss_mode)
++            rollout_is_weights = model_inputs.get("rollout_is_weights", None)
++            
++            pg_loss, _ = policy_loss_fn(
++                old_log_prob=old_log_prob,
++                log_prob=log_prob,
++                advantages=advantages,
++                response_mask=response_mask, # Use the bisect mask
++                loss_agg_mode=loss_agg_mode,
++                config=self.config,
++                rollout_is_weights=rollout_is_weights,
++            )
++            
++            policy_loss = pg_loss
++            if calculate_entropy and entropy is not None:
++                entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++                if entropy_coeff != 0:
++                    policy_loss -= entropy_agg * entropy_coeff
++
++            if self.config.use_kl_loss:
++                ref_log_prob = model_inputs["ref_log_prob"]
++                kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
++                kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++                policy_loss += kl_loss * self.config.kl_loss_coef
++
++            # Scale loss appropriate to recompute context (simplified scaling as we compare magnitude)
++            if self.config.use_dynamic_bsz:
++                loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
++            else:
++                loss_scale_factor = 1 / self.gradient_accumulation
++            loss = policy_loss * loss_scale_factor
++        
++        if self.scaler is not None:
++            self.scaler.scale(loss).backward()
++        else:
++            loss.backward()
++
++        global_norm = self._compute_grad_norm()
++        return global_norm
++
++    def _bisect_rank_search(self, model_inputs, response_mask, threshold_unit: float, temperature: float, on_policy: bool = False) -> int:
++        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        l, r = 0, world_size - 1
++        while l < r:
++            mid = (l + r) // 2
++            grad_norm_left = self._compute_grad_norm_recompute(
++                model_inputs=model_inputs, response_mask=response_mask, active_rank_range=(l, mid), temperature=temperature, on_policy=on_policy
++            )
++            grad_norm_right = self._compute_grad_norm_recompute(
++                model_inputs=model_inputs, response_mask=response_mask, active_rank_range=(mid + 1, r), temperature=temperature, on_policy=on_policy
++            )
++            thr_left = threshold_unit * math.sqrt(mid - l + 1)
++            thr_right = threshold_unit * math.sqrt(r - mid)
++            if rank == 0:
++                print(f"Bisect Rank: l={l}, r={r}, mid={mid}, g_left={grad_norm_left:.4f}, g_right={grad_norm_right:.4f}, thr_l={thr_left:.4f}, thr_r={thr_right:.4f}")
++            
++            if grad_norm_left.detach().item() > grad_norm_right.detach().item():
++                if grad_norm_left.detach().item() < thr_left:
++                    return -1
++                r = mid
++            else:
++                if grad_norm_right.detach().item() < thr_right:
++                    return -1
++                l = mid + 1
++        return l
++
++    def _micro_batch_search(self, cached: list, threshold: float, total_num_tokens: int, global_steps: int, batch_idx: int, temperature: float, on_policy: bool = False) -> tuple:
++        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        dump_dir = self.config.get("bisect_dump_dir", "bisect_dump")
++        
++        target_mb_idx = -1
++        max_grad_norm = 0.0
++        
++        # Heuristic threshold per unit
++        threshold_unit = threshold / math.sqrt(max(1, total_num_tokens)) / math.sqrt(world_size) * math.sqrt(len(cached))
++        
++        for i, (micro_batch, model_inputs) in enumerate(cached):
++            grad_norm = self._compute_grad_norm_recompute(
++                model_inputs=model_inputs, response_mask=model_inputs["response_mask"], 
++                active_rank_range=(0, world_size - 1), temperature=temperature, on_policy=on_policy
++            )
++            if rank == 0:
++                print(f"MB {i} grad_norm = {grad_norm.detach().item():.4f}, threshold = {threshold_unit * math.sqrt(world_size):.4f}")
++            
++            val = grad_norm.detach().item()
++            if val > threshold_unit * math.sqrt(world_size):
++                if val > max_grad_norm:
++                    max_grad_norm = val
++                    target_mb_idx = int(i)
++        
++        if target_mb_idx == -1:
++            return -1, -1, -1, -1, []
++
++        model_inputs = cached[target_mb_idx][1]
++        target_rank = self._bisect_rank_search(model_inputs, model_inputs["response_mask"], threshold_unit, temperature, on_policy=on_policy)
++        
++        if target_rank == -1:
++            return -1, -1, -1, -1, []
++
++        if int(rank) == target_rank:
++            print(f"Rank {rank} identified as target rank for spike.")
++            
++        response_mask_full = model_inputs["response_mask"]
++        idx_full = response_mask_full.nonzero()
++        target_mb_response_idx = idx_full
++        target_mb_resp_mask_template = response_mask_full
++
++        # Dump basic info
++        if int(rank) == target_rank:
++            os.makedirs(dump_dir, exist_ok=True)
++            out_path_ids = os.path.join(
++                dump_dir,
++                f"spike_inputs_gs{int(global_steps)}_rank{int(rank)}_batch{int(batch_idx)}_mb{int(target_mb_idx)}.json",
++            )
++            try:
++                # Convert tensors to list for json
++                payload_ids = {
++                    "rank": int(rank),
++                    "global_steps": int(global_steps),
++                    "input_ids": model_inputs["input_ids"].detach().cpu().tolist(),
++                    "advantages": model_inputs["advantages"][..., 0].detach().cpu().tolist(),
++                    "response_mask": response_mask_full.detach().cpu().tolist(),
++                }
++                with open(out_path_ids, "w") as f:
++                    json.dump(payload_ids, f)
++            except Exception as e:
++                print(f"Failed to dump spike inputs: {e}")
++
++        return target_rank, target_mb_idx, target_mb_response_idx, target_mb_resp_mask_template
++
++    def _bisect_process(
++        self,
++        *,
++        cached: list,
++        target_rank: int,
++        target_mb_idx: int,
++        target_mb_response_idx: torch.Tensor,
++        target_mb_resp_mask_template: torch.Tensor,
++        threshold: float,
++        bisect_budget: int,
++        dump_dir: str,
++        temperature: float,
++        on_policy: bool = False,
++        global_steps: int = 0
++    ):
++        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        device = next(self.actor_module.parameters()).device
++        hit_tokens = []
++        stack = [(target_mb_idx, 0, len(target_mb_response_idx) - 1)]
++        used_steps = 0
++
++        def build_mask_like(template: torch.Tensor, idx: torch.Tensor, l: int, r: int) -> torch.Tensor:
++            mask = torch.zeros_like(template)
++            if idx.shape[0] == 0 or r < l:
++                return mask
++            sub = idx[l : r + 1]
++            mask[sub[:, 0], sub[:, 1]] = 1
++            return mask
++
++        while used_steps + 2 <= bisect_budget:
++            # Check if stack is empty globally
++            stack_empty_local = 1 if (rank != target_rank or len(stack) == 0) else 0
++            stack_empty = torch.tensor(stack_empty_local, device=device, dtype=torch.int32)
++            if torch.distributed.is_initialized():
++                torch.distributed.all_reduce(stack_empty, op=torch.distributed.ReduceOp.MIN)
++            if stack_empty.item() == 1:
++                break
++
++            if rank != target_rank or len(stack) == 0:
++                # Idle step for non-target ranks to keep sync
++                dummy_inputs = cached[target_mb_idx][1]
++                self._compute_grad_norm_recompute(dummy_inputs, dummy_inputs["response_mask"], active_rank_range=(-1, -1), temperature=temperature, on_policy=on_policy)
++                self._compute_grad_norm_recompute(dummy_inputs, dummy_inputs["response_mask"], active_rank_range=(-1, -1), temperature=temperature, on_policy=on_policy)
++                used_steps += 2
++                continue
++
++            mb_i, l, r = stack.pop()
++            idx = target_mb_response_idx
++            model_inputs = cached[target_mb_idx][1]
++            
++            mid = (l + r) // 2
++            left_mask = build_mask_like(target_mb_resp_mask_template, idx, l, mid)
++            grad_norm_left = self._compute_grad_norm_recompute(
++                model_inputs, left_mask, active_rank_range=(target_rank, target_rank), temperature=temperature, on_policy=on_policy
++            )
++            
++            right_mask = build_mask_like(target_mb_resp_mask_template, idx, mid + 1, r)
++            grad_norm_right = self._compute_grad_norm_recompute(
++                model_inputs, right_mask, active_rank_range=(target_rank, target_rank), temperature=temperature, on_policy=on_policy
++            )
++            used_steps += 2
++
++            size_left = max(1, int(mid - l + 1))
++            size_right = max(1, int(r - (mid + 1) + 1))
++            
++            thr_left = threshold / math.sqrt(size_left) / world_size
++            thr_right = threshold / math.sqrt(size_right) / world_size
++            
++            segments = [
++                {"l": l, "r": mid, "grad": grad_norm_left, "thr": thr_left},
++                {"l": mid + 1, "r": r, "grad": grad_norm_right, "thr": thr_right},
++            ]
++            
++            if rank == 0:
++                print(f"Bisect: range=[{l}, {r}], g_l={grad_norm_left:.2f}, g_r={grad_norm_right:.2f}, thr_l={thr_left:.2f}")
++
++            # Prioritize higher gradient segments
++            segments_sorted = sorted(segments, key=lambda x: x["grad"].detach().item())
++            
++            to_push = []
++            for seg in segments_sorted:
++                if seg["grad"].detach().item() > seg["thr"]:
++                    if seg["l"] == seg["r"]:
++                        # Found a single token spike
++                        print(f"Rank {rank} FOUND spike token (mb={mb_i}, idx={seg['l']}) grad={seg['grad']:.2f}")
++                        if idx.shape[0] > seg["l"]:
++                            b, s = idx[seg["l"]].tolist()
++                            token_info = {
++                                "mb_idx": int(mb_i),
++                                "b": int(b), "s": int(s),
++                                "grad_norm": float(seg["grad"].detach().item()),
++                                "input_id": model_inputs["responses"][int(b), s].detach().item(),
++                            }
++                            hit_tokens.append(token_info)
++                    elif seg["l"] < seg["r"]:
++                        to_push.append(seg)
++            
++            for seg in sorted(to_push, key=lambda x: x["grad"].detach().item()):
++                stack.append((mb_i, seg["l"], seg["r"]))
++
++        # Dump results
++        if len(hit_tokens) > 0 and rank == target_rank:
++            os.makedirs(dump_dir, exist_ok=True)
++            out_path = os.path.join(dump_dir, f"bisect_tokens_gs{global_steps}_rank{rank}.json")
++            with open(out_path, "w") as f:
++                json.dump({"hit_tokens": hit_tokens}, f)
++                
++        return hit_tokens, used_steps
++    # --- END BISECT GRADIENT SPIKE HELPERS ---
+ 
+     @GPUMemoryLogger(role="dp actor", logger=logger)
+     def update_policy(self, data: DataProto):
+@@ -448,6 +747,8 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                 self.actor_optimizer.zero_grad()
+ 
++                total_num_tokens = 0
++
+                 for micro_batch in micro_batches:
+                     micro_batch = micro_batch.to(get_device_id())
+                     micro_batch_metrics = {}
+@@ -456,6 +757,8 @@ class DataParallelPPOActor(BasePPOActor):
+                     old_log_prob = model_inputs["old_log_probs"]
+                     advantages = model_inputs["advantages"]
+ 
++                    total_num_tokens += response_mask.sum().item()
++
+                     entropy_coeff = self.config.entropy_coeff
+                     loss_agg_mode = self.config.loss_agg_mode
+ 
+@@ -548,9 +851,118 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                     append_to_dict(metrics, micro_batch_metrics)
++                
++                # --- START BISECT LOGIC ---
++                # Check for gradient spike before optimizer step
++                # Note: If scaler is used, grads are scaled. _compute_grad_norm handles simplistic unscaling.
++                grad_norm_check = self._compute_grad_norm()
++                
++                # Aggregate total tokens for threshold logic
++                total_tokens_tensor = torch.tensor(total_num_tokens, device=get_device_id(), dtype=torch.int32)
++                if torch.distributed.is_initialized():
++                    torch.distributed.all_reduce(total_tokens_tensor, op=torch.distributed.ReduceOp.SUM)
++                
++                grad_norm_threshold = self.config.get("grad_norm_threshold", 100.0)
++                full_threshold = grad_norm_threshold / math.sqrt(max(1, total_tokens_tensor.item())) * len(micro_batches)
++                
++                is_spike = grad_norm_check.detach().item() > full_threshold
++                is_spike_tensor = torch.tensor(1 if is_spike else 0, device=get_device_id(), dtype=torch.int32)
++                if torch.distributed.is_initialized():
++                    torch.distributed.all_reduce(is_spike_tensor, op=torch.distributed.ReduceOp.MAX)
++                
++                if self.config.spike_detection and is_spike_tensor.item() == 1:
++                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++                    if rank == 0:
++                        logger.warning(f"Gradient Spike Detected! Norm: {grad_norm_check.detach().item():.4f} > Thr: {full_threshold:.4f}. Starting Bisect Search.")
++                    
++                    # 1. Clear gradients to prepare for search
++                    self.actor_optimizer.zero_grad()
++                    
++                    # 2. Prepare cached inputs for search
++                    cached_inputs = []
++                    with torch.no_grad():
++                        for mb in micro_batches:
++                            mb = mb.to(get_device_id())
++                            minputs = {**mb.batch, **mb.non_tensor_batch}
++                            cached_inputs.append((mb, minputs))
++
++                    # 3. Perform Binary Search
++                    current_global_steps = data.meta_info.get("global_steps", -1)
++                    target_rank, target_mb_idx, target_mb_response_idx, target_mb_resp_mask_template = \
++                        self._micro_batch_search(
++                            cached_inputs, grad_norm_threshold, total_tokens_tensor.item(), 
++                            current_global_steps, batch_idx, temperature, on_policy=on_policy
++                        )
++                    
++                    if target_rank != -1:
++                        self._bisect_process(
++                            cached=cached_inputs,
++                            target_rank=target_rank,
++                            target_mb_idx=target_mb_idx,
++                            target_mb_response_idx=target_mb_response_idx,
++                            target_mb_resp_mask_template=target_mb_resp_mask_template,
++                            threshold=grad_norm_threshold,
++                            bisect_budget=self.config.get("bisect_budget_steps", 1000),
++                            dump_dir=self.config.get("bisect_dump_dir", "bisect_dump"),
++                            temperature=temperature,
++                            on_policy=on_policy,
++                            global_steps=current_global_steps
++                        )
++
++                    # 4. Re-run normal Backward to restore gradients for the actual step
++                    # This ensures training continues even after logging the spike
++                    self.actor_optimizer.zero_grad()
++                    for micro_batch in micro_batches:
++                        # ... Re-executing the forward-backward loop exactly as above ...
++                        # Simplified copy of the loop body for restoration
++                        micro_batch = micro_batch.to(get_device_id())
++                        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
++                        response_mask = model_inputs["response_mask"]
++                        
++                        # Recalculate basic required vars
++                        if self.config.use_dynamic_bsz:
++                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
++                        else:
++                            loss_scale_factor = 1 / self.gradient_accumulation
++                        
++                        # all return: (bsz, response_length)
++                        entropy, log_prob = self._forward_micro_batch(
++                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
++                        )
++                        
++                        # Recalculate Loss
++                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
++                            old_log_prob = model_inputs["old_log_probs"]
++                        else:
++                            if on_policy:
++                                old_log_prob = log_prob.detach()
++                            else:
++                                old_log_prob = model_inputs["old_log_probs"]
++                            
++                        pg_loss, _ = policy_loss_fn(
++                            old_log_prob=old_log_prob, log_prob=log_prob, advantages=model_inputs["advantages"],
++                            response_mask=response_mask, loss_agg_mode=loss_agg_mode, config=self.config,
++                            rollout_is_weights=model_inputs.get("rollout_is_weights", None)
++                        )
++                        policy_loss = pg_loss
++                        if calculate_entropy and entropy is not None:
++                            entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++                            if entropy_coeff != 0:
++                                policy_loss -= entropy_agg * entropy_coeff
++                        if self.config.use_kl_loss:
++                            kld = kl_penalty(logprob=log_prob, ref_logprob=model_inputs["ref_log_prob"], kl_penalty=self.config.kl_loss_type)
++                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++                            policy_loss += kl_loss * self.config.kl_loss_coef
++                        
++                        loss = policy_loss * loss_scale_factor
++                        if self.scaler is not None:
++                            self.scaler.scale(loss).backward()
++                        else:
++                            loss.backward()
++                # --- END BISECT LOGIC ---
+ 
+                 grad_norm = self._optimizer_step()
+                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                 append_to_dict(metrics, mini_batch_metrics)
+         self.actor_optimizer.zero_grad()
+-        return metrics
++        return metrics
+\ No newline at end of file
