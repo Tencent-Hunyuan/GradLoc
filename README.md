@@ -63,7 +63,7 @@ This rewrites `patches/gradloc.patch` from:
 ## 📬 Contact Us
 
 - Guanhua Huang: `TBD`
-- Tingqiang Xu: `TBD`
+- Tingqiang Xu: `xtq23@mails.tsinghua.edu.cn`
 - Jinbo Wang: `TBD`
 
 ## 📚 Citation
