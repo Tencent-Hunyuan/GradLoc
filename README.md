@@ -16,12 +16,12 @@
 
 [![Blog](https://img.shields.io/badge/Blog-darkgreen?style=for-the-badge)](https://hy.tencent.com/research/100015?langVersion=en)
 [![博客](https://img.shields.io/badge/博客-brightgreen?style=for-the-badge)](https://hy.tencent.com/research/100015?langVersion=zh)
-[![X](https://img.shields.io/badge/-black?style=for-the-badge&logo=X)](#TBD)
-[![XHS](https://img.shields.io/badge/XHS-%23FF2442?style=for-the-badge)](#TBD)
-[![Zhihu](https://img.shields.io/badge/Zhihu-%230084FF?style=for-the-badge)](#TBD)
-[![WX](https://img.shields.io/badge/WeChat-%2307C160?style=for-the-badge)](#TBD)
+[![X](https://img.shields.io/badge/-black?style=for-the-badge&logo=X)](#-tbd)
+[![XHS](https://img.shields.io/badge/XHS-%23FF2442?style=for-the-badge)](#-tbd)
+[![Zhihu](https://img.shields.io/badge/Zhihu-%230084FF?style=for-the-badge)](#-tbd)
+[![WX](https://img.shields.io/badge/WeChat-%2307C160?style=for-the-badge)](#-tbd)
 <!--[![arxiv](https://img.shields.io/badge/arXiv-%23B31B1B.svg?style=for-the-badge&logo=arXiv
-)](#TBD)-->
+)](#-tbd)-->
 
 <img src="assets/hunyuan.png" alt="Tencent-Hunyuan" width="150"/>
 
